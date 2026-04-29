@@ -1,0 +1,88 @@
+package org.turnbox.app.vpn.desktop
+
+import org.turnbox.app.data.model.LocationConfig
+import java.nio.file.Path
+import kotlin.test.Test
+import kotlin.test.assertContains
+import kotlin.test.assertEquals
+
+class DesktopProxyModeTest {
+
+    @Test
+    fun pacRoutesLocalTrafficDirectAndEverythingElseThroughSocks() {
+        val pac = PacServer.generatePac("127.0.0.1", 10808)
+
+        assertContains(pac, "isPlainHostName(host)")
+        assertContains(pac, "host == \"localhost\"")
+        assertContains(pac, "SOCKS5 127.0.0.1:10808; SOCKS 127.0.0.1:10808")
+    }
+
+    @Test
+    fun olcRtcCommandUsesLocationProviderRoomAndKey() {
+        LocationConfig.supportedBypassProviders.forEach { provider ->
+            val command = OlcRtcCommand(
+                binary = Path.of("/tmp/olcrtc"),
+                location = LocationConfig("Test", "room-$provider", "b".repeat(64), provider),
+                socksHost = "127.0.0.1",
+                socksPort = 10808
+            ).args()
+
+            assertEquals("/tmp/olcrtc", command[0])
+            assertEquals(listOf("-mode", "cnc"), command.slice(1..2))
+            assertContains(command, provider)
+            assertContains(command, "room-$provider")
+            assertContains(command, "10808")
+        }
+    }
+
+    @Test
+    fun macOsProxyCommandsEnableAndRestorePacPerService() {
+        val enable = MacOsProxyController.enableCommands(listOf("Wi-Fi"), "http://127.0.0.1:10809/proxy.pac")
+        assertEquals(
+            listOf(
+                listOf("networksetup", "-setautoproxyurl", "Wi-Fi", "http://127.0.0.1:10809/proxy.pac"),
+                listOf("networksetup", "-setautoproxystate", "Wi-Fi", "on")
+            ),
+            enable
+        )
+
+        val restore = MacOsProxyController.restoreCommands(
+            listOf(
+                MacOsAutoProxyState("Wi-Fi", enabled = true, url = "http://old/proxy.pac"),
+                MacOsAutoProxyState("USB", enabled = false, url = null)
+            )
+        )
+        assertEquals(
+            listOf(
+                listOf("networksetup", "-setautoproxyurl", "Wi-Fi", "http://old/proxy.pac"),
+                listOf("networksetup", "-setautoproxystate", "Wi-Fi", "on"),
+                listOf("networksetup", "-setautoproxystate", "USB", "off")
+            ),
+            restore
+        )
+    }
+
+    @Test
+    fun windowsProxyCommandsBackupShapeIsRestorable() {
+        val enable = WindowsProxyController.enableCommands("http://127.0.0.1:10809/proxy.pac")
+        assertEquals("reg", enable.first().first())
+        assertContains(enable.flatten(), "AutoConfigURL")
+        assertContains(enable.flatten(), "http://127.0.0.1:10809/proxy.pac")
+        assertEquals("powershell.exe", enable.last().first())
+
+        val restore = WindowsProxyController.restoreCommands(
+            WindowsProxyState(
+                proxyEnable = "0x1",
+                proxyServer = "127.0.0.1:8888",
+                proxyOverride = "<local>",
+                autoConfigUrl = null
+            )
+        )
+
+        assertContains(restore.flatten(), "ProxyEnable")
+        assertContains(restore.flatten(), "ProxyServer")
+        assertContains(restore.flatten(), "ProxyOverride")
+        assertContains(restore.flatten(), "AutoConfigURL")
+        assertContains(restore.flatten(), "delete")
+    }
+}

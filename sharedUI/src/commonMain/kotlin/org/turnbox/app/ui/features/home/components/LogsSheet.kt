@@ -31,7 +31,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
@@ -128,7 +127,6 @@ fun LogsContent(
                     Text(
                         text = log,
                         fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
                         color = getLogColor(log),
                         modifier = Modifier.padding(vertical = 2.dp)
                     )

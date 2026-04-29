@@ -8,7 +8,7 @@ import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
-import org.turnbox.app.ui.features.home.HomeScreen
+import org.turnbox.app.ui.TurnboxAppContent
 import org.turnbox.app.ui.features.home.HomeScreenViewModel
 import org.turnbox.app.ui.features.locations.LocationViewModel
 
@@ -38,8 +38,8 @@ fun AndroidMainScreen(
         }
     }
 
-    HomeScreen(
-        viewModel = viewModel,
+    TurnboxAppContent(
+        homeViewModel = viewModel,
         locationViewModel = locationViewModel,
         onToggleClick = {
             val prepIntent = VpnService.prepare(context)
