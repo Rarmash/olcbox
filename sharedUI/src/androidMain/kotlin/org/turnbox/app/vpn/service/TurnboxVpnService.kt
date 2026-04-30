@@ -27,6 +27,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import mobile.LogWriter
 import mobile.Mobile
 import mobile.SocketProtector
@@ -37,6 +38,8 @@ import org.turnbox.app.data.model.LocationConfig
 import org.turnbox.app.data.repository.LocationsRepository
 import org.turnbox.app.vpn.VpnStatus
 import java.io.File
+import java.net.InetSocketAddress
+import java.net.Socket
 import kotlin.concurrent.thread
 import kotlin.coroutines.coroutineContext
 
@@ -55,18 +58,23 @@ class TurnboxVpnService : VpnService() {
 
     private var startupJob: Job? = null
     private var watchdogJob: Job? = null
-    private var retryJob: Job? = null
     private var cleanupJob: Job? = null
     private var generation = 0L
+    private var recoveryRequestedForGeneration = 0L
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var tun2socksThread: Thread? = null
+    @Volatile
+    private var tun2socksStarted = false
+    @Volatile
+    private var tun2socksStopRequested = false
 
     private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var connectivityManager: ConnectivityManager
     private var currentNetwork: Network? = null
     private var isCallbackRegistered = false
-    private var lastMigrationTime: Long = 0L
+    private var localSocksPort = LOCAL_SOCKS_PORT_BASE
+    private var nextSocksPort = LOCAL_SOCKS_PORT_BASE
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -75,35 +83,55 @@ class TurnboxVpnService : VpnService() {
 
         override fun onLost(network: Network) {
             addLog("Network lost")
+            if (network == currentNetwork) {
+                updateUnderlyingNetwork(null)
+                unbindProcessFromNetwork()
+            }
             scope.launch {
                 delay(NETWORK_LOSS_FALLBACK_DELAY_MS)
-                findActiveUpstreamNetwork()?.let { handleNetworkChange(it, "Fallback") }
+                val upstream = findActiveUpstreamNetwork()
+                if (upstream != null) {
+                    handleNetworkChange(upstream, "Fallback")
+                } else if (TurnboxVpnState.status.value is VpnStatus.Connected ||
+                    TurnboxVpnState.status.value is VpnStatus.Reconnecting
+                ) {
+                    setStatus(VpnStatus.Reconnecting)
+                    updateNotification("Waiting for network...")
+                    addLog("Waiting for validated network")
+                }
             }
         }
 
         override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-            if (network == currentNetwork || caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+            if (network == currentNetwork || caps.isValidatedUpstream()) {
                 handleNetworkChange(network, "Capabilities")
             }
         }
 
         private fun handleNetworkChange(network: Network, reason: String) {
             val caps = connectivityManager.getNetworkCapabilities(network) ?: return
-            if (!caps.isUsableUpstream()) return
+            if (!caps.isValidatedUpstream()) return
 
-            val upstream = findActiveUpstreamNetwork() ?: network
-            if (currentNetwork == upstream) return
+            val upstream = findActiveUpstreamNetwork() ?: return
+            if (currentNetwork == upstream) {
+                if (TurnboxVpnState.status.value is VpnStatus.Reconnecting &&
+                    startupJob?.isActive != true
+                ) {
+                    addLog("Network $reason: ${getNetName(upstream)}")
+                    startTunnel(isMigration = true)
+                }
+                return
+            }
 
             updateUnderlyingNetwork(upstream)
             addLog("Network $reason: ${getNetName(upstream)}")
 
-            if (TurnboxVpnState.status.value !is VpnStatus.Connected) return
+            when (TurnboxVpnState.status.value) {
+                is VpnStatus.Connected,
+                is VpnStatus.Reconnecting -> startTunnel(isMigration = true)
 
-            val now = System.currentTimeMillis()
-            if (now - lastMigrationTime < MIGRATION_DEBOUNCE_MS) return
-            lastMigrationTime = now
-
-            startTunnel(isMigration = true)
+                else -> Unit
+            }
         }
     }
 
@@ -130,10 +158,6 @@ class TurnboxVpnService : VpnService() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-        }
-
-        if (TurnboxVpnState.status.value is VpnStatus.Connected || TurnboxVpnState.status.value is VpnStatus.Connecting) {
-            return START_STICKY
         }
 
         startForeground()
@@ -168,16 +192,34 @@ class TurnboxVpnService : VpnService() {
                 val line = msg.trimEnd()
                 addLog("rtc: $line")
                 Log.v("olcrtc", line)
+                handleRtcLine(line)
             }
         })
     }
 
     private fun startTunnel(isMigration: Boolean) {
         startupJob?.cancel()
-        retryJob?.cancel()
+        watchdogJob?.cancel()
+        if (!isMigration) {
+            recoveryRequestedForGeneration = 0L
+        }
         val requestedGeneration = ++generation
 
         startupJob = scope.launch {
+            cleanupJob?.takeIf { it.isActive }?.let {
+                addLog("Waiting for previous VPN stop to finish")
+                val completed = withTimeoutOrNull(PREVIOUS_STOP_WAIT_MS) {
+                    it.join()
+                    true
+                } ?: false
+
+                if (!completed) {
+                    addLog("Previous VPN stop is still pending; forcing transport cleanup")
+                    it.cancel()
+                    stopTransportProcesses(closeTun = true, waitForSocksPort = false)
+                }
+            }
+
             tunnelMutex.withLock {
                 coroutineContext.ensureActive()
                 if (requestedGeneration != generation) return@withLock
@@ -187,7 +229,7 @@ class TurnboxVpnService : VpnService() {
                 if (location == null || !location.isComplete()) {
                     setStatus(VpnStatus.Error("No active location"))
                     updateNotification("Add a location first")
-                    stopTransportProcesses(closeTun = true)
+                    stopTransportProcesses(closeTun = true, waitForSocksPort = false)
                     return@withLock
                 }
 
@@ -203,25 +245,30 @@ class TurnboxVpnService : VpnService() {
     private suspend fun reconnectTransport(location: LocationConfig, requestedGeneration: Long) {
         setStatus(VpnStatus.Reconnecting)
         updateNotification("Reconnecting...")
-        stopMobile()
-        delay(TRANSPORT_RESTART_GRACE_MS)
+        val upstream = findActiveUpstreamNetwork()
+        if (upstream == null) {
+            updateUnderlyingNetwork(null)
+            unbindProcessFromNetwork()
+            updateNotification("Waiting for network...")
+            addLog("No validated upstream network; keeping tunnel alive")
+            return
+        }
+
+        updateUnderlyingNetwork(upstream)
+        stopMobileAndWait()
         coroutineContext.ensureActive()
         if (requestedGeneration != generation) return
 
-        val upstream = findActiveUpstreamNetwork()
-        if (upstream != null) {
-            updateUnderlyingNetwork(upstream)
-            bindProcessToNetwork(upstream, "Bound to ${getNetName(upstream)}")
-        }
-
-        if (startMobile(location)) {
-            upstream?.let { bindProcessToNetwork(it, "Keeping olcRTC bound to ${getNetName(it)}") }
+        if (startMobile(location, upstream, setErrorOnFailure = false)) {
             setStatus(VpnStatus.Connected)
+            recoveryRequestedForGeneration = 0L
             updateNotification("VPN Connected")
             addLog("Transport reconnected")
+            startWatchdog()
         } else {
-            unbindProcessFromNetwork()
-            scheduleRetry(fullRestart = true)
+            updateUnderlyingNetwork(null)
+            setStatus(VpnStatus.Reconnecting)
+            updateNotification("Waiting for transport...")
         }
     }
 
@@ -232,22 +279,35 @@ class TurnboxVpnService : VpnService() {
     ) {
         setStatus(if (isMigration) VpnStatus.Reconnecting else VpnStatus.Connecting)
         updateNotification("Connecting...")
-        stopTransportProcesses(closeTun = true)
-        delay(TRANSPORT_RESTART_GRACE_MS)
+        stopTransportProcesses(closeTun = true, waitForSocksPort = false)
         coroutineContext.ensureActive()
         if (requestedGeneration != generation) return
 
-        val upstream = findActiveUpstreamNetwork()
-        if (upstream != null) {
-            updateUnderlyingNetwork(upstream)
-            bindProcessToNetwork(upstream, "Bound to ${getNetName(upstream)}")
-        } else {
-            addLog("No validated upstream network")
+        val socksPort = chooseAvailableSocksPort()
+        if (socksPort == null) {
+            setStatus(VpnStatus.Error("No free local SOCKS port"))
+            updateNotification("Connection failed")
+            return
         }
+        localSocksPort = socksPort
 
-        if (!startMobile(location)) {
+        val upstream = findActiveUpstreamNetwork()
+        if (upstream == null) {
+            updateUnderlyingNetwork(null)
             unbindProcessFromNetwork()
-            scheduleRetry(fullRestart = true)
+            addLog("No validated upstream network")
+            setStatus(VpnStatus.Reconnecting)
+            updateNotification("Waiting for network...")
+            return
+        }
+        updateUnderlyingNetwork(upstream)
+
+        if (!startMobile(location, upstream, setErrorOnFailure = !isMigration)) {
+            if (isMigration) {
+                updateUnderlyingNetwork(null)
+                setStatus(VpnStatus.Reconnecting)
+                updateNotification("Waiting for transport...")
+            }
             return
         }
 
@@ -256,16 +316,13 @@ class TurnboxVpnService : VpnService() {
 
         val pfd = establishSystemVpnTunnel()
         if (pfd == null) {
-            stopMobile()
-            scheduleRetry(fullRestart = true)
+            stopMobileAndWait()
             return
         }
 
         vpnInterface = pfd
-        currentNetwork?.let { bindProcessToNetwork(it, "Keeping olcRTC bound to ${getNetName(it)}") }
         if (!startTun2socks(pfd)) {
             stopTransportProcesses(closeTun = true)
-            scheduleRetry(fullRestart = true)
             return
         }
 
@@ -273,32 +330,48 @@ class TurnboxVpnService : VpnService() {
         if (requestedGeneration != generation) return
 
         setStatus(VpnStatus.Connected)
+        recoveryRequestedForGeneration = 0L
         updateNotification("VPN Connected")
         addLog("VPN tunnel established")
         startWatchdog()
     }
 
-    private fun startMobile(location: LocationConfig): Boolean {
+    private suspend fun startMobile(
+        location: LocationConfig,
+        upstream: Network,
+        setErrorOnFailure: Boolean
+    ): Boolean {
         return try {
             installMobileCallbacks()
+            val socksPort = localSocksPort
+            waitForSocksPortReleased(socksPort, SOCKS_RELEASE_QUICK_TIMEOUT_MS)
+            if (isLocalSocksPortOpen(socksPort)) {
+                throw IllegalStateException("SOCKS port $socksPort is still in use")
+            }
+            bindProcessToNetwork(upstream, "Bound to ${getNetName(upstream)}")
             addLog("Starting olcRTC provider=${location.bypassProvider}, room=${location.id}")
             Mobile.start(
                 location.bypassProvider,
                 location.id,
                 location.key,
-                LOCAL_SOCKS_PORT.toLong(),
+                socksPort.toLong(),
                 "",
                 ""
             )
             Mobile.waitReady(MOBILE_READY_TIMEOUT_MS)
-            addLog("olcRTC ready on 127.0.0.1:$LOCAL_SOCKS_PORT")
+            addLog("olcRTC ready on 127.0.0.1:$socksPort")
             true
         } catch (e: Exception) {
             addLog("olcRTC start failed: ${e.message}")
-            stopMobile()
-            setStatus(VpnStatus.Error(e.message ?: "Transport failed"))
-            updateNotification("Connection failed")
+            unbindProcessFromNetwork()
+            stopMobileAndWait()
+            if (setErrorOnFailure) {
+                setStatus(VpnStatus.Error(e.message ?: "Transport failed"))
+                updateNotification("Connection failed")
+            }
             false
+        } finally {
+            unbindProcessFromNetwork()
         }
     }
 
@@ -313,12 +386,19 @@ class TurnboxVpnService : VpnService() {
 
             val nativeFd = ParcelFileDescriptor.dup(pfd.fileDescriptor).detachFd()
             val configFile = writeTun2socksConfig()
+            tun2socksStarted = true
+            tun2socksStopRequested = false
             tun2socksThread = thread(name = "TurnboxTun2Socks", isDaemon = true) {
-                val result = startTun2socksNative(configFile.absolutePath, nativeFd)
-                if (TurnboxVpnState.status.value !is VpnStatus.Stopping && result != 0) {
-                    addLog("tun2socks exited with code $result")
-                } else {
-                    addLog("tun2socks stopped")
+                try {
+                    val result = startTun2socksNative(configFile.absolutePath, nativeFd)
+                    if (TurnboxVpnState.status.value !is VpnStatus.Stopping && result != 0) {
+                        addLog("tun2socks exited with code $result")
+                    } else {
+                        addLog("tun2socks stopped")
+                    }
+                } finally {
+                    tun2socksStarted = false
+                    tun2socksStopRequested = false
                 }
             }
             true
@@ -368,7 +448,7 @@ class TurnboxVpnService : VpnService() {
 
             socks5:
               address: 127.0.0.1
-              port: $LOCAL_SOCKS_PORT
+              port: $localSocksPort
               udp: 'tcp'
               pipeline: false
 
@@ -401,13 +481,13 @@ class TurnboxVpnService : VpnService() {
                 when {
                     !Mobile.isRunning() -> {
                         addLog("Watchdog: olcRTC stopped")
-                        scheduleRetry(fullRestart = false)
+                        requestTransportRecovery("olcRTC stopped", fullRestart = false)
                         return@launch
                     }
 
                     tun2socksThread?.isAlive != true -> {
                         addLog("Watchdog: tun2socks stopped")
-                        scheduleRetry(fullRestart = true)
+                        requestTransportRecovery("tun2socks stopped", fullRestart = true)
                         return@launch
                     }
                 }
@@ -415,31 +495,22 @@ class TurnboxVpnService : VpnService() {
         }
     }
 
-    private fun scheduleRetry(fullRestart: Boolean) {
-        retryJob?.cancel()
-        retryJob = scope.launch {
-            delay(RESTART_DELAY_MS)
-            if (fullRestart) {
-                vpnInterface?.close()
-                vpnInterface = null
-            }
-            startTunnel(isMigration = true)
-        }
-    }
-
     private fun cleanup(stopService: Boolean = true) {
         val status = TurnboxVpnState.status.value
-        if (status is VpnStatus.Disconnected && vpnInterface == null && tun2socksThread == null) {
+        if (status is VpnStatus.Disconnected &&
+            vpnInterface == null &&
+            tun2socksThread == null &&
+            cleanupJob?.isActive != true
+        ) {
             if (stopService) stopSelf()
             return
         }
         if (status is VpnStatus.Stopping && cleanupJob?.isActive == true) return
 
-        generation++
+        val cleanupGeneration = ++generation
         setStatus(VpnStatus.Stopping)
         startupJob?.cancel()
         watchdogJob?.cancel()
-        retryJob?.cancel()
         wakeLock?.let { if (it.isHeld) it.release() }
 
         if (isCallbackRegistered) {
@@ -449,39 +520,132 @@ class TurnboxVpnService : VpnService() {
         updateUnderlyingNetwork(null)
         unbindProcessFromNetwork()
 
-        stopTun2socks()
         cleanupVpnInterface()
         tun2socksThread?.interrupt()
         tun2socksThread = null
-        setStatus(VpnStatus.Disconnected)
-        addLog("VPN stopped")
 
-        cleanupJob?.cancel()
         cleanupJob = scope.launch {
             try {
-                stopMobile()
+                stopTransportProcesses(closeTun = true)
+                recoveryRequestedForGeneration = 0L
+                if (generation == cleanupGeneration) {
+                    setStatus(VpnStatus.Disconnected)
+                    addLog("VPN stopped")
+                }
             } finally {
-                if (stopService) stopSelf()
+                if (stopService && generation == cleanupGeneration) stopSelf()
             }
         }
     }
 
-    private fun stopTransportProcesses(closeTun: Boolean) {
-        stopMobile()
+    private suspend fun stopTransportProcesses(
+        closeTun: Boolean,
+        waitForSocksPort: Boolean = true
+    ) {
         stopTun2socks()
         if (closeTun) cleanupVpnInterface()
         tun2socksThread?.interrupt()
         tun2socksThread = null
+        if (waitForSocksPort) {
+            stopMobileAndWait()
+        } else {
+            stopMobile()
+        }
     }
 
     private fun stopTun2socks() {
-        if (nativeLibrariesLoaded) {
+        if (nativeLibrariesLoaded && tun2socksStarted && !tun2socksStopRequested) {
+            tun2socksStopRequested = true
             runCatching { stopTun2socksNative() }
         }
     }
 
     private fun stopMobile() {
         runCatching { Mobile.stop() }
+    }
+
+    private suspend fun stopMobileAndWait() {
+        val socksPort = localSocksPort
+        stopMobile()
+        waitForSocksPortReleased(socksPort)
+    }
+
+    private suspend fun waitForSocksPortReleased(
+        port: Int = localSocksPort,
+        timeoutMs: Long = SOCKS_RELEASE_TIMEOUT_MS
+    ) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (!isLocalSocksPortOpen(port)) return
+            delay(SOCKS_RELEASE_POLL_MS)
+        }
+        addLog("SOCKS port $port is still busy after stop")
+    }
+
+    private fun isLocalSocksPortOpen(port: Int): Boolean {
+        return runCatching {
+            Socket().use { socket ->
+                socket.connect(
+                    InetSocketAddress("127.0.0.1", port),
+                    SOCKET_CONNECT_TIMEOUT_MS
+                )
+            }
+        }.isSuccess
+    }
+
+    private fun chooseAvailableSocksPort(): Int? {
+        repeat(LOCAL_SOCKS_PORT_MAX - LOCAL_SOCKS_PORT_BASE + 1) {
+            val candidate = nextSocksPort
+            nextSocksPort = if (candidate >= LOCAL_SOCKS_PORT_MAX) {
+                LOCAL_SOCKS_PORT_BASE
+            } else {
+                candidate + 1
+            }
+            if (!isLocalSocksPortOpen(candidate)) return candidate
+        }
+        return null
+    }
+
+    private fun handleRtcLine(line: String) {
+        val lowerLine = line.lowercase()
+
+        if (lowerLine.contains("ice connection state changed: failed") ||
+            lowerLine.contains("peer connection state changed: failed")
+        ) {
+            requestTransportRecovery("RTC failed", fullRestart = false)
+            return
+        }
+
+        if (lowerLine.contains("ice connection state changed: closed") ||
+            lowerLine.contains("peer connection state changed: closed")
+        ) {
+            if (!Mobile.isRunning()) {
+                requestTransportRecovery("RTC closed", fullRestart = false)
+            }
+        }
+    }
+
+    private fun requestTransportRecovery(reason: String, fullRestart: Boolean) {
+        if (TurnboxVpnState.status.value !is VpnStatus.Connected) return
+
+        val recoveryGeneration = generation
+        if (recoveryRequestedForGeneration == recoveryGeneration) return
+
+        recoveryRequestedForGeneration = recoveryGeneration
+        addLog("$reason; reconnecting transport")
+        if (fullRestart) {
+            scope.launch {
+                tunnelMutex.withLock {
+                    stopTun2socks()
+                    cleanupVpnInterface()
+                    tun2socksThread?.interrupt()
+                    tun2socksThread = null
+                }
+                startTunnel(isMigration = true)
+            }
+        } else {
+            startTunnel(isMigration = true)
+        }
     }
 
     private fun cleanupVpnInterface() {
@@ -507,25 +671,17 @@ class TurnboxVpnService : VpnService() {
     private fun findActiveUpstreamNetwork(): Network? {
         val candidates = connectivityManager.allNetworks.mapNotNull { network ->
             val caps = connectivityManager.getNetworkCapabilities(network) ?: return@mapNotNull null
-            if (!caps.isUsableUpstream()) return@mapNotNull null
+            if (!caps.isValidatedUpstream()) return@mapNotNull null
             network to caps
         }
 
         val active = connectivityManager.activeNetwork
-        candidates.firstOrNull { (network, caps) ->
-            network == active && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-        }?.let { return it.first }
         candidates.firstOrNull { (network, _) -> network == active }?.let { return it.first }
         candidates.firstOrNull { (_, caps) ->
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
-                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
         }?.let { return it.first }
         candidates.firstOrNull { (_, caps) ->
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
-                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-        }?.let { return it.first }
-        candidates.firstOrNull { (_, caps) ->
-            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
         }?.let { return it.first }
         return candidates.firstOrNull()?.first
     }
@@ -533,6 +689,11 @@ class TurnboxVpnService : VpnService() {
     private fun NetworkCapabilities.isUsableUpstream(): Boolean {
         return !hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
             hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun NetworkCapabilities.isValidatedUpstream(): Boolean {
+        return isUsableUpstream() &&
+            hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
     private fun updateUnderlyingNetwork(network: Network?) {
@@ -657,14 +818,17 @@ class TurnboxVpnService : VpnService() {
         const val ACTION_START_VPN = TurnboxVpnActions.ACTION_START_VPN
         const val ACTION_STOP_VPN = TurnboxVpnActions.ACTION_STOP_VPN
 
-        private const val LOCAL_SOCKS_PORT = 10808
+        private const val LOCAL_SOCKS_PORT_BASE = 10808
+        private const val LOCAL_SOCKS_PORT_MAX = 10848
         private const val MOBILE_READY_TIMEOUT_MS = 25_000L
-        private const val TRANSPORT_RESTART_GRACE_MS = 300L
+        private const val PREVIOUS_STOP_WAIT_MS = 2_000L
         private const val TUNNEL_HANDOFF_DELAY_MS = 300L
-        private const val RESTART_DELAY_MS = 2_000L
-        private const val MIGRATION_DEBOUNCE_MS = 500L
         private const val NETWORK_LOSS_FALLBACK_DELAY_MS = 300L
         private const val WATCHDOG_INTERVAL_MS = 5_000L
+        private const val SOCKS_RELEASE_TIMEOUT_MS = 2_500L
+        private const val SOCKS_RELEASE_QUICK_TIMEOUT_MS = 500L
+        private const val SOCKS_RELEASE_POLL_MS = 100L
+        private const val SOCKET_CONNECT_TIMEOUT_MS = 150
         private const val WAKE_LOCK_TIMEOUT_MS = 24 * 60 * 60 * 1000L
         private const val TUN_MTU = 1500
         private const val TUN_IPV4_ADDRESS = "10.0.88.88"

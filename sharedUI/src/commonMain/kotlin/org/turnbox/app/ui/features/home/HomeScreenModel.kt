@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.turnbox.app.data.exporter.LogExporter
 import org.turnbox.app.data.importer.ConfigImporter
 import org.turnbox.app.data.model.LocationConfig
 import org.turnbox.app.data.repository.LocationsRepository
@@ -16,7 +17,8 @@ import org.turnbox.app.vpn.VpnStatus
 class HomeScreenViewModel(
     private val vpnManager: VpnManager,
     private val locationsRepository: LocationsRepository,
-    private val configImporter: ConfigImporter
+    private val configImporter: ConfigImporter,
+    private val logExporter: LogExporter
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(
@@ -98,12 +100,22 @@ class HomeScreenViewModel(
     }
 
     fun ToggleVpn() {
-        if (_state.value.isVpnLoading) return
+        val status = vpnManager.status.value
+        if (_state.value.isVpnLoading ||
+            status is VpnStatus.Connecting ||
+            status is VpnStatus.Reconnecting
+        ) {
+            viewModelScope.launch {
+                vpnManager.stopVpn()
+                _state.update { it.copy(isVpnConnected = false, isVpnLoading = false) }
+            }
+            return
+        }
 
         viewModelScope.launch {
             _state.update { it.copy(isVpnLoading = true) }
             try {
-                if (_state.value.isVpnConnected) {
+                if (_state.value.isVpnConnected || vpnManager.status.value is VpnStatus.Connected) {
                     vpnManager.stopVpn()
                 } else {
                     val active = locationsRepository.getActiveLocation()
@@ -122,6 +134,21 @@ class HomeScreenViewModel(
             } catch (e: Exception) {
                 _state.update { it.copy(isVpnLoading = false) }
             }
+        }
+    }
+
+    fun restartVpnIfRunning() {
+        when (vpnManager.status.value) {
+            VpnStatus.Connected,
+            VpnStatus.Connecting,
+            VpnStatus.Reconnecting -> viewModelScope.launch {
+                _state.update { it.copy(isVpnLoading = true) }
+                vpnManager.startVpn()
+            }
+
+            VpnStatus.Disconnected,
+            VpnStatus.Stopping,
+            is VpnStatus.Error -> Unit
         }
     }
 
@@ -153,6 +180,31 @@ class HomeScreenViewModel(
     fun onCopyFullConfigClicked() {
         viewModelScope.launch {
             configImporter.copyToClipboard(locationsRepository.exportBundle())
+        }
+    }
+
+    fun suggestedLogsFileName(): String = "turnbox-logs.txt"
+
+    fun onSaveLogsToFile(
+        target: Any,
+        onSaved: (String) -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            val content = buildLogsExport(logs.value)
+            logExporter.writeLogs(target, content)
+                .onSuccess { savedPath ->
+                    onSaved(
+                        if (savedPath.isBlank() || savedPath == "Logs saved") {
+                            "Logs saved"
+                        } else {
+                            "Logs saved to $savedPath"
+                        }
+                    )
+                }
+                .onFailure { error ->
+                    onError(error.message ?: "Failed to save logs")
+                }
         }
     }
 
@@ -197,6 +249,17 @@ class HomeScreenViewModel(
                         startBlockedReason = e.message ?: "Import failed"
                     )
                 }
+            }
+        }
+    }
+
+    private fun buildLogsExport(logs: List<String>): String {
+        return buildString {
+            appendLine("Turnbox application logs")
+            appendLine("Entries: ${logs.size}")
+            appendLine()
+            logs.forEachIndexed { index, line ->
+                appendLine("${index + 1}. $line")
             }
         }
     }

@@ -43,7 +43,8 @@ fun HomeScreen(
             viewModel.loadCurrentConfig()
         }
     },
-    onCopyConfigRequested: () -> Unit = { viewModel.onCopyFullConfigClicked() }
+    onCopyConfigRequested: () -> Unit = { viewModel.onCopyFullConfigClicked() },
+    onSaveLogsRequested: (onSaved: (String) -> Unit, onError: (String) -> Unit) -> Unit = { _, _ -> }
 ) {
     val scrollState = rememberScrollState()
     var isLocationSettingsOpen by remember { mutableStateOf(false) }
@@ -87,7 +88,7 @@ fun HomeScreen(
             StartButton(
                 isActive = state.isVpnConnected,
                 isLoading = state.isVpnLoading,
-                enabled = state.isVpnConnected || state.canStartVpn,
+                enabled = state.isVpnLoading || state.isVpnConnected || state.canStartVpn,
                 onClick = { onToggleClick() }
             )
             Spacer(
@@ -105,6 +106,7 @@ fun HomeScreen(
                 onLocationSelected = { id ->
                     locationViewModel.selectLocation(id) {
                         viewModel.loadCurrentConfig()
+                        viewModel.restartVpnIfRunning()
                     }
                 },
                 onLocationSettingsClick = { id ->
@@ -135,6 +137,12 @@ fun HomeScreen(
                 val logs by viewModel.logs.collectAsState()
                 LogsSheet(
                     logs = logs,
+                    onSaveClick = {
+                        onSaveLogsRequested(
+                            { message -> scope.launch { snackbarHostState.showSnackbar(message) } },
+                            { message -> scope.launch { snackbarHostState.showSnackbar(message) } }
+                        )
+                    },
                     onDismiss = { isLogsSheetOpen = false }
                 )
             }

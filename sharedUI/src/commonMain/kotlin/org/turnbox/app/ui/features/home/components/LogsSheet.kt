@@ -23,6 +23,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -39,6 +40,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun LogsSheet(
     logs: List<String>,
+    onSaveClick: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(
@@ -62,6 +64,7 @@ fun LogsSheet(
         LogsContent(
             logs = logs,
             modifier = Modifier.fillMaxHeight(0.8f),
+            onSaveClick = onSaveClick,
             onCloseClick = { closeSheet() }
         )
     }
@@ -71,6 +74,7 @@ fun LogsSheet(
 fun LogsContent(
     logs: List<String>,
     modifier: Modifier = Modifier,
+    onSaveClick: () -> Unit,
     onCloseClick: () -> Unit
 ) {
     val listState = rememberLazyListState()
@@ -99,12 +103,21 @@ fun LogsContent(
                 style = MaterialTheme.typography.headlineSmall,
             )
 
-            IconButton(onClick = onCloseClick) {
-                Icon(
-                    imageVector = Icons.Rounded.Close,
-                    contentDescription = "Close logs",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(
+                    enabled = logs.isNotEmpty(),
+                    onClick = onSaveClick
+                ) {
+                    Text("Save")
+                }
+
+                IconButton(onClick = onCloseClick) {
+                    Icon(
+                        imageVector = Icons.Rounded.Close,
+                        contentDescription = "Close logs",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
 

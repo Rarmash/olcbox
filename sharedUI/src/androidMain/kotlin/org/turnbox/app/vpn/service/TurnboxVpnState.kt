@@ -23,8 +23,9 @@ object TurnboxVpnState {
 
     fun addLog(msg: String) {
         Log.d(TAG, msg)
-        _logs.update { (it + msg).takeLast(120) }
+        _logs.update { (it + msg).takeLast(MAX_LOG_ENTRIES) }
     }
 
+    private const val MAX_LOG_ENTRIES = 5_000
     private const val TAG = "TurnboxVpnService"
 }

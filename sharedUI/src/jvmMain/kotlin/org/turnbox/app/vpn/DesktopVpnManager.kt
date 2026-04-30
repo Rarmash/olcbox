@@ -70,21 +70,32 @@ class DesktopVpnManager private constructor(
 
     override fun startVpn() {
         val requestGeneration = ++generation
-        operationJob?.cancel()
         operationJob = scope.launch {
             mutex.withLock {
                 if (requestGeneration != generation) return@withLock
-                startDesktopMode()
+                val shouldRestart = _status.value is VpnStatus.Connected ||
+                    _status.value is VpnStatus.Connecting ||
+                    _status.value is VpnStatus.Reconnecting ||
+                    process != null ||
+                    tunProcess != null
+
+                if (shouldRestart) {
+                    setStatus(VpnStatus.Reconnecting)
+                    addLog("Restarting desktop VPN for selected location")
+                    stopDesktopMode(finalStatus = false)
+                    if (requestGeneration != generation) return@withLock
+                }
+
+                startDesktopMode(requestGeneration, isRestart = shouldRestart)
             }
         }
     }
 
     override fun stopVpn() {
         generation++
-        operationJob?.cancel()
         operationJob = scope.launch {
             mutex.withLock {
-                stopDesktopMode()
+                stopDesktopMode(finalStatus = true)
             }
         }
     }
@@ -117,18 +128,15 @@ class DesktopVpnManager private constructor(
     fun close() {
         runBlocking {
             generation++
-            operationJob?.cancel()
             mutex.withLock {
-                stopDesktopMode()
+                stopDesktopMode(finalStatus = true)
             }
             scope.cancel()
         }
     }
 
-    private suspend fun startDesktopMode() {
-        if (_status.value is VpnStatus.Connected || _status.value is VpnStatus.Connecting) return
-
-        setStatus(VpnStatus.Connecting)
+    private suspend fun startDesktopMode(requestGeneration: Long, isRestart: Boolean) {
+        setStatus(if (isRestart) VpnStatus.Reconnecting else VpnStatus.Connecting)
         val active = locationsRepository.getActiveLocation()
         val location = active?.location?.normalized()
         if (location == null || !location.isComplete()) {
@@ -149,20 +157,31 @@ class DesktopVpnManager private constructor(
                 logOutput = true,
                 privileged = useLinuxTun
             )
-            waitForOlcRtcReady(process ?: error("olcRTC process is missing"), ready, PacServer.LOCAL_SOCKS_PORT)
+            waitForOlcRtcReady(
+                process = process ?: error("olcRTC process is missing"),
+                ready = ready,
+                socksPort = PacServer.LOCAL_SOCKS_PORT,
+                requestGeneration = requestGeneration
+            )
+            if (requestGeneration != generation) throw CancellationException("Desktop start superseded")
             if (useLinuxTun) {
                 val hevBinary = DesktopNativeAssets.resolveHevSocks5TunnelBinary()
                 tunProcess = linuxTunController.start(hevBinary)
+                if (requestGeneration != generation) throw CancellationException("Desktop start superseded")
                 startTunLogReader(tunProcess ?: error("hev-socks5-tunnel process is missing"))
             } else {
                 pacServer.start()
                 proxyController.enable(pacServer.url)
+                if (requestGeneration != generation) throw CancellationException("Desktop start superseded")
             }
             setStatus(VpnStatus.Connected)
             addLog(if (useLinuxTun) "Desktop Linux TUN connected" else "Desktop proxy connected")
         } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            addLog("Desktop start failed: ${e.message}")
+            if (e is CancellationException) {
+                addLog("Desktop start cancelled")
+            } else {
+                addLog("Desktop start failed: ${e.message}")
+            }
             if (DesktopPaths.os == DesktopOs.Linux) {
                 runCatching { linuxTunController.stop(tunProcess) }
                     .onFailure { addLog("Linux TUN cleanup failed: ${it.message}") }
@@ -173,11 +192,13 @@ class DesktopVpnManager private constructor(
             pacServer.stop()
             stopProcess(process)
             process = null
-            setStatus(VpnStatus.Error(e.message ?: "Desktop start failed"))
+            if (e !is CancellationException && requestGeneration == generation) {
+                setStatus(VpnStatus.Error(e.message ?: "Desktop start failed"))
+            }
         }
     }
 
-    private suspend fun stopDesktopMode() {
+    private suspend fun stopDesktopMode(finalStatus: Boolean) {
         if (_status.value is VpnStatus.Disconnected && process == null && tunProcess == null) return
 
         setStatus(VpnStatus.Stopping)
@@ -198,8 +219,10 @@ class DesktopVpnManager private constructor(
         logJob = null
         tunLogJob?.cancel()
         tunLogJob = null
-        setStatus(VpnStatus.Disconnected)
-        addLog(if (DesktopPaths.os == DesktopOs.Linux) "Desktop Linux TUN stopped" else "Desktop proxy stopped")
+        if (finalStatus) {
+            setStatus(VpnStatus.Disconnected)
+            addLog(if (DesktopPaths.os == DesktopOs.Linux) "Desktop Linux TUN stopped" else "Desktop proxy stopped")
+        }
     }
 
     private fun startOlcRtcProcess(
@@ -254,10 +277,14 @@ class DesktopVpnManager private constructor(
     private suspend fun waitForOlcRtcReady(
         process: Process,
         ready: CompletableDeferred<Unit>,
-        socksPort: Int
+        socksPort: Int,
+        requestGeneration: Long? = null
     ) {
         val deadline = System.currentTimeMillis() + OLC_READY_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
+            if (requestGeneration != null && requestGeneration != generation) {
+                throw CancellationException("Desktop start superseded")
+            }
             if (ready.isCompleted || canConnectToSocks(socksPort)) return
             if (!process.isAlive) error("olcRTC exited before SOCKS5 was ready")
             delay(READY_POLL_INTERVAL_MS)
@@ -300,10 +327,11 @@ class DesktopVpnManager private constructor(
     }
 
     private fun addLog(message: String) {
-        _logs.update { (it + message).takeLast(120) }
+        _logs.update { (it + message).takeLast(MAX_LOG_ENTRIES) }
     }
 
     private companion object {
+        const val MAX_LOG_ENTRIES = 5_000
         const val OLC_READY_TIMEOUT_MS = 25_000L
         const val READY_POLL_INTERVAL_MS = 200L
         const val TCP_CONNECT_TIMEOUT_MS = 250L

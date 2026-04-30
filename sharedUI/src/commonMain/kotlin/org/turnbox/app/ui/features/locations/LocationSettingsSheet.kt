@@ -216,7 +216,11 @@ fun LocationSettingsContent(
 
             Button(
                 onClick = {
-                    viewModel.saveEditing { onDismiss() }
+                    viewModel.saveEditing {
+                        homeViewModel.loadCurrentConfig()
+                        homeViewModel.restartVpnIfRunning()
+                        onDismiss()
+                    }
                 },
                 modifier = Modifier
                     .weight(1f)

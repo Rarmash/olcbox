@@ -65,7 +65,7 @@ fun StartButton(
             .padding(6.dp)
             .clip(CircleShape)
             .background(color = mainButtonColor)
-            .clickable(enabled = enabled && !isLoading) {
+            .clickable(enabled = enabled) {
                 onClick()
             },
         contentAlignment = Alignment.Center
@@ -93,7 +93,7 @@ fun StartButton(
 
             Text(
                 text = when {
-                    isLoading -> "WAIT..."
+                    isLoading -> "STOP"
                     isActive -> "STOP"
                     !enabled -> "SETUP"
                     else -> "START"

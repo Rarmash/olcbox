@@ -9,6 +9,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import org.turnbox.app.data.datasource.LocationsDataSourceImpl
 import org.turnbox.app.data.datasource.LocationsRepositoryImpl
+import org.turnbox.app.data.exporter.AndroidLogExporter
 import org.turnbox.app.data.importer.AndroidConfigImporter
 import org.turnbox.app.ui.activities.AndroidMainScreen
 import org.turnbox.app.ui.features.home.HomeScreenViewModel
@@ -36,11 +37,13 @@ class AppActivity : ComponentActivity() {
         val locationsDataSource = LocationsDataSourceImpl(this)
         val locationsRepository = LocationsRepositoryImpl(locationsDataSource)
         val configImporter = AndroidConfigImporter(this)
+        val logExporter = AndroidLogExporter(this)
 
         val viewModel = HomeScreenViewModel(
             vpnManager = vpnManager,
             locationsRepository = locationsRepository,
-            configImporter = configImporter
+            configImporter = configImporter,
+            logExporter = logExporter
         )
         
         val locationViewModel = LocationViewModel(
